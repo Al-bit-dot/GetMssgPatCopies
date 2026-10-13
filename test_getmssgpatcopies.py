@@ -71,6 +71,31 @@ class Formats(unittest.TestCase):
         self.assertEqual(g.uspto_text(['01234567', '20120001234']), '("1234567" or "20120001234").pn.\r\n')
         self.assertEqual(g.uspto_text(['01234567']), '("1234567").pn.\r\n')
 
+    def test_long_lists_are_split(self):
+        # The site refused searches above len(line) + quotes = 2481; lines are kept to 2300.
+        def cost(line):
+            return len(line) + line.count('"')
+        patents = ['%08d' % n for n in range(9000000, 9000400)]
+        pubs = ['2015%07d' % n for n in range(1, 400)]
+        self.assertEqual(len(g.uspto_searches(patents[:153])), 1)    # 7-character numbers: 153 fit
+        self.assertEqual(len(g.uspto_searches(patents[:154])), 2)
+        self.assertEqual(len(g.uspto_searches(pubs[:120])), 1)       # published applications: 120 fit
+        self.assertEqual(len(g.uspto_searches(pubs[:121])), 2)
+        new = ['%08d' % n for n in range(10000000, 10000200)]
+        self.assertEqual(len(g.uspto_searches(new[:143])), 1)         # 8-digit patents: 143 fit
+        self.assertEqual(len(g.uspto_searches(new[:144])), 2)
+        mixed = g.sort_canons(patents + pubs + ['D%07d' % n for n in range(512000, 512300)])
+        lines = g.uspto_searches(mixed)
+        self.assertEqual(len(lines), 8)
+        terms = []
+        for line in lines:
+            self.assertLessEqual(cost(line), g.SEARCH_LIMIT)
+            self.assertTrue(line.startswith('("') and line.endswith('").pn.'), line[:20])
+            terms += line[2:-6].split('" or "')
+        self.assertEqual(terms, [g.uspto_number(c) for c in mixed])   # every number once, in order
+        self.assertEqual(g.uspto_text(mixed), ''.join(l + '\r\n' for l in lines))
+        self.assertEqual(g.uspto_searches([]), [])
+
 
 class Folder(unittest.TestCase):
     def setUp(self):
@@ -130,6 +155,17 @@ class Folder(unittest.TestCase):
         self.assertIn('4 numbers with a zero-byte copy', out)
         self.assertIn('("1234567" or "20120001234" or "20190012345" or "D512345").pn.', out)
         self.assertTrue(os.path.exists(os.path.join(self.dir, g.ORDER_NAME)))
+
+    def test_many_missing(self):
+        for n in range(200):
+            open(os.path.join(self.dir, '%d.pdf' % (8000000 + n)), 'wb').close()
+        job = g.Job(self.dir, year=YEAR)
+        self.assertEqual(len(job.result['missing']), 204)
+        self.assertEqual(len(job.searches), 2)
+        self.assertIn('2 lines', ' '.join(job.summary()))
+        self.assertIn('Search 2 of 2:', job.details())
+        job.write()
+        self.assertEqual(self.read(g.USPTO_NAME).decode('ascii').split('\r\n'), job.searches + [''])
 
 
 if __name__ == '__main__':

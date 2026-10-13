@@ -16,8 +16,10 @@ window; otherwise it asks its questions in the terminal.
 
 Files it writes, in the chosen folder:
     MssgPat-Order.txt        the missing numbers, one per line (Fetcher Format, Windows line endings)
-    MssgPat-USPTO-Order.txt  one line for the USPTO Patent Public Search box:
+    MssgPat-USPTO-Order.txt  a search for the USPTO Patent Public Search box:
                              ("9123456" or "20020123457").pn.
+                             (one line; a long list is split into several lines,
+                             each one search, because the site refuses longer searches)
 """
 
 import argparse
@@ -34,6 +36,13 @@ DESCRIPTION = ('GetMssgPatCopies finds the patent copies in a folder that are ze
 
 ORDER_NAME = 'MssgPat-Order.txt'
 USPTO_NAME = 'MssgPat-USPTO-Order.txt'
+
+# Patent Public Search refuses (HTTP 403) a search whose request is 8 KB or more. The request holds
+# the search three times with each quote escaped, so on 13 October 2026 a line worked up to
+# len(line) + number of quotes = 2481 (130 published applications, 154 patents of 8 digits or 165 of
+# 7 characters) and no further. The site's own settings travel in the same request, so lines are
+# kept to 2300.
+SEARCH_LIMIT = 2300
 
 # ---------------------------------------------------------------------------
 # CORE-START  (pure logic, no user interface; number rules as in PatCopyPrint)
@@ -106,9 +115,33 @@ def order_text(canons):
     return ''.join(c + '\r\n' for c in canons)
 
 
+def search_line(terms):
+    return '(' + ' or '.join(terms) + ').pn.'
+
+
+def uspto_searches(canons):
+    """The searches for the search box, in the order given: ("9123456" or "20020123457").pn.
+
+    One line when the numbers fit in one search, otherwise as many lines as needed, each
+    within SEARCH_LIMIT and each searched on its own. A line holds 120 published applications,
+    143 patents of 8 digits or 153 of 7 characters (older patents, D, RE, PP, H).
+    """
+    lines, terms = [], []
+    for c in canons:
+        term = '"%s"' % uspto_number(c)
+        line = search_line(terms + [term])
+        if terms and len(line) + line.count('"') > SEARCH_LIMIT:
+            lines.append(search_line(terms))
+            terms = []
+        terms.append(term)
+    if terms:
+        lines.append(search_line(terms))
+    return lines
+
+
 def uspto_text(canons):
-    """One line for the search box: ("9123456" or "20020123457").pn."""
-    return '(' + ' or '.join('"%s"' % uspto_number(c) for c in canons) + ').pn.\r\n'
+    """MssgPat-USPTO-Order.txt: the searches, one per line, Windows line endings."""
+    return ''.join(line + '\r\n' for line in uspto_searches(canons))
 
 
 def survey(entries, year):
@@ -217,6 +250,7 @@ class Job(object):
         self.year = year or datetime.date.today().year
         self.result = survey(list_folder(self.folder)[1], self.year)
         missing = self.result['missing']
+        self.searches = uspto_searches(missing)
         self.files = [(ORDER_NAME, order_text(missing)), (USPTO_NAME, uspto_text(missing))] if missing else []
 
     def existing(self):
@@ -234,6 +268,10 @@ class Job(object):
             lines.append('Saved "%s" and "%s" in %s.' % (ORDER_NAME, USPTO_NAME, self.folder))
             lines.append('%s with a zero-byte copy, out of %s named after a US number.'
                          % (plural(len(r['missing']), 'number'), plural(r['copies'], 'file')))
+            if len(self.searches) > 1:
+                lines.append('Too many numbers for one USPTO search, so %s has %d lines: paste and search them '
+                             'one at a time (pasted together they make one search, which the site refuses).'
+                             % (USPTO_NAME, len(self.searches)))
         elif r['copies']:
             lines.append('None of the %s named after a US number is zero bytes; nothing was saved.'
                          % plural(r['copies'], 'file'))
@@ -252,8 +290,10 @@ class Job(object):
         """The numbers found and the two files' contents, for the details area."""
         r = self.result
         rows = ['%-12s %s' % (c, ', '.join(r['files'][c])) for c in r['missing']]
+        searches = '\n\n'.join(self.searches) if len(self.searches) == 1 else '\n\n'.join(
+            'Search %d of %d:\n%s' % (i + 1, len(self.searches), s) for i, s in enumerate(self.searches))
         return ('Missing (%d), in order:\n%s\n\n%s:\n%s'
-                % (len(rows), '\n'.join(rows), USPTO_NAME, uspto_text(r['missing']).rstrip()))
+                % (len(rows), '\n'.join(rows), USPTO_NAME, searches))
 
 
 def plural(n, word):
@@ -387,16 +427,18 @@ def run_gui(args, cfg):
                     ttk.Style().theme_use('clam')
                 except tk.TclError:
                     pass
-            self.minsize(760, 560)
-            if cfg.get('geometry'):
-                try:
-                    self.geometry(cfg.get('geometry'))
-                except tk.TclError:
-                    pass
+            self.minsize(760, 640)
+            try:
+                self.geometry(cfg.get('geometry') or '%dx%d' % (min(840, self.winfo_screenwidth() - 40),
+                                                                min(760, self.winfo_screenheight() - 80)))
+            except tk.TclError:
+                pass
             self.protocol('WM_DELETE_WINDOW', self.close)
             self.folder = None
             self.entries = []       # (kind, full path) for each listbox line
-            self.search = ''        # the USPTO line of the last run
+            self.searches = []      # the USPTO search lines of the last run
+            self.next_search = 0    # the one the copy button copies next
+            self.done_text = ''
             self.build()
             folder = start_folder or cfg.get('folder')
             self.open_folder(folder if folder and os.path.isdir(folder) else os.getcwd())
@@ -411,6 +453,10 @@ def run_gui(args, cfg):
                                   'Patent Public Search page), saved in that folder.' % (ORDER_NAME, USPTO_NAME),
                       wraplength=720, justify='left').pack(anchor='w', pady=(0, 10))
 
+            # The buttons, the result and the details are packed first, at the bottom, so that in a small
+            # window the file list gives up the room, never the result.
+            bottom = ttk.Frame(outer)
+            bottom.pack(side='bottom', fill='x')
             box = ttk.LabelFrame(outer, text=' Folder with the patent copies ', padding=8)
             box.pack(fill='both', expand=True)
             row = ttk.Frame(box)
@@ -419,6 +465,8 @@ def run_gui(args, cfg):
             ttk.Button(row, text='Refresh', command=self.refresh).pack(side='left', padx=6)
             self.path_label = ttk.Label(box, text='', wraplength=700, justify='left', foreground='#555555')
             self.path_label.pack(anchor='w', pady=(6, 2))
+            self.count_label = ttk.Label(box, text='', wraplength=700, justify='left')
+            self.count_label.pack(side='bottom', anchor='w', pady=(6, 0))
             lb_frame = ttk.Frame(box)
             lb_frame.pack(fill='both', expand=True)
             self.listbox = tk.Listbox(lb_frame, height=12, exportselection=False, activestyle='none', font=MONO)
@@ -431,21 +479,22 @@ def run_gui(args, cfg):
             self.listbox.pack(side='left', fill='both', expand=True)
             self.listbox.bind('<<ListboxSelect>>', self.on_pick)
             self.listbox.bind('<Return>', self.on_pick)
-            self.count_label = ttk.Label(box, text='', wraplength=700, justify='left')
-            self.count_label.pack(anchor='w', pady=(6, 0))
 
-            actions = ttk.Frame(outer)
+            actions = ttk.Frame(bottom)
             actions.pack(fill='x', pady=(12, 4))
             self.generate_btn = ttk.Button(actions, text='Generate', command=self.generate)
             self.generate_btn.pack(side='left')
             self.copy_btn = ttk.Button(actions, text='Copy USPTO search', command=self.copy_search)
             self.copy_btn.pack(side='left', padx=8)
             self.copy_btn.state(['disabled'])
-            self.status = ttk.Label(outer, text='', wraplength=720, justify='left')
+            self.status = ttk.Label(bottom, text='', wraplength=720, justify='left')
             self.status.pack(anchor='w')
-            self.details = tk.Text(outer, height=8, font=MONO, wrap='char', state='disabled')
-            self.details_bar = ttk.Scrollbar(outer, orient='vertical', command=self.details.yview)
-            self.details.configure(yscrollcommand=self.details_bar.set)
+            self.details_frame = ttk.Frame(bottom)
+            self.details = tk.Text(self.details_frame, height=7, font=MONO, wrap='char', state='disabled')
+            bar = ttk.Scrollbar(self.details_frame, orient='vertical', command=self.details.yview)
+            self.details.configure(yscrollcommand=bar.set)
+            bar.pack(side='right', fill='y')
+            self.details.pack(side='left', fill='both', expand=True)
 
         # -- folder browsing --
         def choose_folder(self):
@@ -466,6 +515,7 @@ def run_gui(args, cfg):
                 self.hide_details()
                 self.set_status('')
                 self.copy_btn.state(['disabled'])
+                self.copy_btn.configure(text='Copy USPTO search')
             self.folder = folder
             self.cfg.set('folder', folder)
             self.cfg.save()
@@ -518,16 +568,15 @@ def run_gui(args, cfg):
             self.details.delete('1.0', 'end')
             self.details.insert('1.0', text)
             self.details.configure(state='disabled')
-            self.details_bar.pack(side='right', fill='y')
-            self.details.pack(fill='both', expand=True, pady=(6, 0))
+            self.details_frame.pack(fill='x', pady=(6, 0))
 
         def hide_details(self):
-            self.details.pack_forget()
-            self.details_bar.pack_forget()
+            self.details_frame.pack_forget()
 
         def generate(self):
             self.hide_details()
             self.copy_btn.state(['disabled'])
+            self.copy_btn.configure(text='Copy USPTO search')
             try:
                 job = Job(self.folder)
                 existing = job.existing()
@@ -543,16 +592,26 @@ def run_gui(args, cfg):
             self.done_text = '\n'.join(job.summary())
             self.set_status(self.done_text, 'ok' if job.files else 'warn')
             if job.files:
-                self.search = uspto_text(job.result['missing']).rstrip()
+                self.searches = job.searches
+                self.next_search = 0
+                self.label_copy_btn()
                 self.copy_btn.state(['!disabled'])
                 self.show_details(job.details())
             self.refresh()
 
+        def label_copy_btn(self):
+            n = len(self.searches)
+            self.copy_btn.configure(text='Copy USPTO search' if n == 1 else
+                                    'Copy USPTO search %d of %d' % (self.next_search + 1, n))
+
         def copy_search(self):
+            i, n = self.next_search, len(self.searches)
             self.clipboard_clear()
-            self.clipboard_append(self.search)
-            self.set_status(self.done_text + '\nCopied the USPTO search; paste it into the Patent Public Search box.',
-                            'ok')
+            self.clipboard_append(self.searches[i])
+            self.set_status(self.done_text + '\nCopied the USPTO search%s; paste it into the Patent Public Search box '
+                            'and click Search.' % ('' if n == 1 else ' %d of %d' % (i + 1, n)), 'ok')
+            self.next_search = (i + 1) % n
+            self.label_copy_btn()
 
         def close(self):
             try:
